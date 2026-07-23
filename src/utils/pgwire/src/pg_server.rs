@@ -221,6 +221,7 @@ const ALLOWED_JWT_ALGORITHMS: &[Algorithm] = &[
     Algorithm::PS384,
     Algorithm::PS512,
 ];
+const OAUTH_AUDIENCE_KEY: &str = "audience";
 
 async fn validate_jwt(
     jwt: &str,
@@ -288,12 +289,16 @@ fn validate_jwt_with_jwks(
     let decoding_key = DecodingKey::from_rsa_components(n, e)?;
     let mut validation = Validation::new(alg);
     validation.set_issuer(&[issuer]);
-    validation.set_audience(&[audience_from_cluster_id(cluster_id)]); // JWT 'aud' claim must match cluster_id
+    let audience = metadata
+        .get(OAUTH_AUDIENCE_KEY)
+        .cloned()
+        .unwrap_or_else(|| audience_from_cluster_id(cluster_id));
+    validation.set_audience(&[audience]); // JWT 'aud' claim must match the configured audience.
     validation.set_required_spec_claims(&["exp", "iss", "aud"]);
     let token_data = decode::<HashMap<String, serde_json::Value>>(jwt, &decoding_key, &validation)?;
 
     // 4. Check if the metadata in the token matches.
-    if !metadata.iter().all(
+    if !metadata.iter().filter(|(k, _)| k.as_str() != OAUTH_AUDIENCE_KEY).all(
         |(k, v)| matches!(token_data.claims.get(k), Some(serde_json::Value::String(s)) if s == v),
     ) {
         return Err("metadata in jwt does not match with metadata declared with user".into());
@@ -676,7 +681,7 @@ mod tests {
         use rsa::{RsaPrivateKey, RsaPublicKey};
         use serde_json::json;
 
-        use crate::pg_server::{Jwk, Jwks, validate_jwt_with_jwks};
+        use crate::pg_server::{Jwk, Jwks, OAUTH_AUDIENCE_KEY, validate_jwt_with_jwks};
 
         fn create_test_rsa_keys() -> (RsaPrivateKey, RsaPublicKey) {
             let mut rng = rand::thread_rng();
@@ -780,6 +785,40 @@ mod tests {
 
             let error = result.unwrap_err();
             assert!(error.to_string().contains("InvalidAudience"));
+        }
+
+        #[test]
+        fn test_jwt_with_configured_audience() {
+            let (private_key, public_key) = create_test_rsa_keys();
+            let jwks = create_test_jwks(&public_key, "test-kid", Some("RS256"));
+
+            let mut metadata = HashMap::new();
+            metadata.insert(
+                OAUTH_AUDIENCE_KEY.to_owned(),
+                "urn:sn:cloud:o-for6u".to_owned(),
+            );
+
+            let mut additional_claims = HashMap::new();
+            additional_claims.insert("aud".to_owned(), json!(["urn:sn:cloud:o-for6u"]));
+            let jwt = create_jwt_token(
+                &private_key,
+                "test-kid",
+                Algorithm::RS256,
+                "https://test-issuer.com",
+                None,
+                get_future_timestamp(),
+                additional_claims,
+            );
+
+            let result = validate_jwt_with_jwks(
+                &jwt,
+                &jwks,
+                "https://test-issuer.com",
+                "test-cluster-id",
+                &metadata,
+            );
+
+            assert!(result.unwrap());
         }
 
         #[test]
