@@ -27,9 +27,13 @@ use crate::connector_common::AwsAuthProps;
 use crate::error::ConnectorResult;
 use crate::parser::PROTOBUF_MESSAGES_AS_JSONB;
 use crate::schema::AWS_GLUE_SCHEMA_ARN_KEY;
+use crate::schema::pulsar_schema::PulsarSchemaClientConfig;
 use crate::schema::schema_registry::SchemaRegistryConfig;
 use crate::source::cdc::CDC_MONGODB_STRONG_SCHEMA_KEY;
-use crate::source::{SourceColumnDesc, SourceEncode, SourceFormat, extract_source_struct};
+use crate::source::{
+    PULSAR_CONNECTOR, SourceColumnDesc, SourceEncode, SourceFormat, UPSTREAM_SOURCE_KEY,
+    extract_source_struct,
+};
 
 pub const PARQUET_CASE_INSENSITIVE_KEY: &str = "parquet.case_insensitive";
 
@@ -176,7 +180,25 @@ impl SpecificParserConfig {
                     map_handling: MapHandling::from_options(&format_encode_options_with_secret)?,
                     ..Default::default()
                 };
-                config.schema_location = if let Some(schema_arn) =
+                config.schema_location = if let Some(client_config) =
+                    PulsarSchemaClientConfig::from_options(&format_encode_options_with_secret)?
+                {
+                    if !options_with_secret
+                        .get(UPSTREAM_SOURCE_KEY)
+                        .is_some_and(|connector| connector.eq_ignore_ascii_case(PULSAR_CONNECTOR))
+                    {
+                        bail!("Pulsar schema options require connector = 'pulsar'");
+                    }
+                    let topic = options_with_secret
+                        .get("pulsar.topic")
+                        .or_else(|| options_with_secret.get("topic"))
+                        .ok_or_else(|| anyhow::anyhow!("Must specify 'pulsar.topic' or 'topic'"))?
+                        .clone();
+                    SchemaLocation::Pulsar {
+                        client_config,
+                        topic,
+                    }
+                } else if let Some(schema_arn) =
                     format_encode_options_with_secret.get(AWS_GLUE_SCHEMA_ARN_KEY)
                 {
                     risingwave_common::license::Feature::GlueSchemaRegistry
@@ -348,6 +370,12 @@ pub enum SchemaLocation {
         // When `Some(_)`, ignore AWS and load schemas from provided config
         mock_config: Option<String>,
     },
+    /// Pulsar Admin API schema endpoint. Pulsar Avro payloads are raw datum bytes, and their writer
+    /// schema version is carried in message metadata rather than a payload header.
+    Pulsar {
+        client_config: PulsarSchemaClientConfig,
+        topic: String,
+    },
 }
 
 // TODO: `SpecificParserConfig` shall not `impl`/`derive` a `Default`
@@ -411,5 +439,56 @@ impl From<&BTreeMap<String, String>> for MongoProperties {
             .get(CDC_MONGODB_STRONG_SCHEMA_KEY)
             .is_some_and(|k| k.eq_ignore_ascii_case("true"));
         Self { strong_schema }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use risingwave_pb::plan_common::{EncodeType, FormatType};
+
+    use super::*;
+    use crate::schema::pulsar_schema::{PULSAR_SCHEMA_AUTH_TOKEN_KEY, PULSAR_SCHEMA_URL_KEY};
+
+    #[test]
+    fn pulsar_schema_config_is_separate_from_broker_auth() {
+        let info = StreamSourceInfo {
+            format: FormatType::Plain as i32,
+            row_encode: EncodeType::Avro as i32,
+            format_encode_options: BTreeMap::from([
+                (
+                    PULSAR_SCHEMA_URL_KEY.to_owned(),
+                    "https://pulsar-admin:8443".to_owned(),
+                ),
+                (
+                    PULSAR_SCHEMA_AUTH_TOKEN_KEY.to_owned(),
+                    "schema-token".to_owned(),
+                ),
+            ]),
+            ..Default::default()
+        };
+        let source_options = WithOptionsSecResolved::without_secrets(BTreeMap::from([
+            (UPSTREAM_SOURCE_KEY.to_owned(), PULSAR_CONNECTOR.to_owned()),
+            (
+                "topic".to_owned(),
+                "persistent://tenant/namespace/events".to_owned(),
+            ),
+            ("auth.token".to_owned(), "broker-token".to_owned()),
+        ]));
+
+        let config = SpecificParserConfig::new(&info, &source_options).unwrap();
+        let EncodingProperties::Avro(AvroProperties {
+            schema_location:
+                SchemaLocation::Pulsar {
+                    client_config,
+                    topic,
+                },
+            ..
+        }) = config.encoding_config
+        else {
+            panic!("expected Pulsar Avro parser config");
+        };
+        assert_eq!(topic, "persistent://tenant/namespace/events");
+        assert_eq!(client_config.admin_url(), "https://pulsar-admin:8443");
+        assert_eq!(client_config.bearer_token(), Some("schema-token"));
     }
 }
