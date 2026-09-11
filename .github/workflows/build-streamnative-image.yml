@@ -2,6 +2,17 @@ name: build-streamnative-image
 
 on:
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Git ref to build
+        required: true
+        default: v3.1.0-rc.1-sn.1
+        type: string
+      image_tag:
+        description: Release image tag
+        required: true
+        default: v3.1.0-rc.1-sn.1
+        type: string
 
 permissions:
   contents: read
@@ -13,14 +24,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: streamnative
+          ref: ${{ inputs.source_ref }}
           fetch-depth: 1
 
       - name: Compute tags
         id: tags
         run: |
-          echo "timestamp=$(date -u +%Y%m%d-%H%M%S)" >> "$GITHUB_OUTPUT"
-          echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse --short=10 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "full_commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] || [ -n "${{ secrets.DOCKER_USER }}" ]; then
             echo "hub-creds=true" >> "$GITHUB_OUTPUT"
           else
@@ -46,7 +57,10 @@ jobs:
           platforms: linux/amd64
           build-args: |
             CARGO_PROFILE=release
-          tags: ghcr.io/mattisonchao/risingwave:streamnative-${{ steps.tags.outputs.commit }}
+            GIT_SHA=${{ steps.tags.outputs.full_commit }}
+          tags: |
+            ghcr.io/mattisonchao/risingwave:${{ inputs.image_tag }}
+            ghcr.io/mattisonchao/risingwave:${{ inputs.image_tag }}-${{ steps.tags.outputs.commit }}
 
       - name: Make GHCR package public
         env:
@@ -67,11 +81,13 @@ jobs:
           USERNAME="${DOCKERHUB_USERNAME:-$DOCKER_USER}"
           TOKEN="${DOCKERHUB_TOKEN:-$DOCKER_PASSWORD}"
           echo "$TOKEN" | docker login -u "$USERNAME" --password-stdin
-          docker tag ghcr.io/mattisonchao/risingwave:streamnative-${{ steps.tags.outputs.commit }} \
-            mattison/risingwave:${{ steps.tags.outputs.timestamp }}
-          docker push mattison/risingwave:${{ steps.tags.outputs.timestamp }}
+          docker buildx imagetools create \
+            --tag mattison/risingwave:${{ inputs.image_tag }} \
+            --tag mattison/risingwave:${{ inputs.image_tag }}-${{ steps.tags.outputs.commit }} \
+            ghcr.io/mattisonchao/risingwave:${{ inputs.image_tag }}-${{ steps.tags.outputs.commit }}
 
       - name: Report
         run: |
-          echo "GHCR: ghcr.io/mattisonchao/risingwave:streamnative-${{ steps.tags.outputs.commit }}"
-          echo "DockerHub: mattison/risingwave:${{ steps.tags.outputs.timestamp }} (hub-creds=${{ steps.tags.outputs.hub-creds }})"
+          echo "Source: ${{ inputs.source_ref }} (${{ steps.tags.outputs.full_commit }})"
+          echo "GHCR: ghcr.io/mattisonchao/risingwave:${{ inputs.image_tag }}-${{ steps.tags.outputs.commit }}"
+          echo "DockerHub: mattison/risingwave:${{ inputs.image_tag }}-${{ steps.tags.outputs.commit }} (hub-creds=${{ steps.tags.outputs.hub-creds }})"
