@@ -17,6 +17,7 @@ use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::rc::Rc;
 
 use pretty_xmlish::{Pretty, XmlNode};
+use risingwave_connector::source::kafka::KafkaOffsetRangeMap;
 use risingwave_pb::batch_plan::SourceNode;
 use risingwave_pb::batch_plan::plan_node::NodeBody;
 
@@ -38,10 +39,17 @@ pub struct BatchKafkaScan {
 
     /// Kafka timestamp range.
     kafka_timestamp_range: (Bound<i64>, Bound<i64>),
+
+    /// Exact per-partition Kafka offset ranges supplied by the planner.
+    kafka_offset_ranges: Option<KafkaOffsetRangeMap>,
 }
 
 impl BatchKafkaScan {
-    pub fn new(core: generic::Source, kafka_timestamp_range: (Bound<i64>, Bound<i64>)) -> Self {
+    pub fn new(
+        core: generic::Source,
+        kafka_timestamp_range: (Bound<i64>, Bound<i64>),
+        kafka_offset_ranges: Option<KafkaOffsetRangeMap>,
+    ) -> Self {
         let base = PlanBase::new_batch_with_core(
             &core,
             // Use `Single` by default, will be updated later with `clone_with_dist`.
@@ -53,6 +61,7 @@ impl BatchKafkaScan {
             base,
             core,
             kafka_timestamp_range,
+            kafka_offset_ranges,
         }
     }
 
@@ -80,6 +89,10 @@ impl BatchKafkaScan {
         (lower_bound, upper_bound)
     }
 
+    pub fn kafka_offset_ranges(&self) -> Option<&KafkaOffsetRangeMap> {
+        self.kafka_offset_ranges.as_ref()
+    }
+
     pub fn clone_with_dist(&self) -> Self {
         let base = self
             .base
@@ -88,6 +101,7 @@ impl BatchKafkaScan {
             base,
             core: self.core.clone(),
             kafka_timestamp_range: self.kafka_timestamp_range,
+            kafka_offset_ranges: self.kafka_offset_ranges.clone(),
         }
     }
 }
@@ -97,11 +111,14 @@ impl_plan_tree_node_for_leaf! { Batch, BatchKafkaScan }
 impl Distill for BatchKafkaScan {
     fn distill<'a>(&self) -> XmlNode<'a> {
         let src = Pretty::from(self.source_catalog().unwrap().name.clone());
-        let fields = vec![
+        let mut fields = vec![
             ("source", src),
             ("columns", column_names_pretty(self.schema())),
             ("filter", Pretty::debug(&self.kafka_timestamp_range_value())),
         ];
+        if let Some(offset_ranges) = &self.kafka_offset_ranges {
+            fields.push(("offset_ranges", Pretty::debug(offset_ranges)));
+        }
         childless_record("BatchKafkaScan", fields)
     }
 }

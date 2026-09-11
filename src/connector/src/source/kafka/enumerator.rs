@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, LazyLock, Weak};
 use std::time::Duration;
 
@@ -36,7 +36,7 @@ use crate::connector_common::read_kafka_log_level;
 use crate::error::{ConnectorError, ConnectorResult};
 use crate::source::SourceEnumeratorContextRef;
 use crate::source::base::SplitEnumerator;
-use crate::source::kafka::split::KafkaSplit;
+use crate::source::kafka::split::{KafkaOffsetRangeMap, KafkaSplit};
 use crate::source::kafka::{
     KAFKA_ISOLATION_LEVEL, KafkaConnectionProps, KafkaContextCommon, KafkaProperties,
     RwConsumerContext,
@@ -446,6 +446,31 @@ impl KafkaSplitEnumerator {
             .collect::<Vec<KafkaSplit>>())
     }
 
+    /// Enumerate bounded batch splits from exact per-partition offset ranges.
+    ///
+    /// The requested ranges use half-open `[start, stop)` semantics. They must cover every
+    /// partition exactly and remain within the broker's current watermarks. These checks make a
+    /// stale or incomplete plan fail instead of returning an incomplete result.
+    pub async fn list_splits_batch_by_offset_ranges(
+        &mut self,
+        offset_ranges: &KafkaOffsetRangeMap,
+    ) -> ConnectorResult<Vec<KafkaSplit>> {
+        let topic_partitions = self.fetch_topic_partition().await.with_context(|| {
+            format!(
+                "failed to fetch metadata from kafka ({})",
+                self.broker_address
+            )
+        })?;
+        let watermarks = self.get_watermarks(topic_partitions.as_ref()).await?;
+
+        build_splits_for_offset_ranges(
+            &self.topic,
+            topic_partitions.as_ref(),
+            &watermarks,
+            offset_ranges,
+        )
+    }
+
     async fn fetch_stop_offset(
         &self,
         partitions: &[i32],
@@ -622,5 +647,150 @@ impl KafkaSplitEnumerator {
             .iter()
             .map(|partition| partition.id())
             .collect())
+    }
+}
+
+fn build_splits_for_offset_ranges(
+    topic: &str,
+    topic_partitions: &[i32],
+    watermarks: &HashMap<i32, (i64, i64)>,
+    offset_ranges: &KafkaOffsetRangeMap,
+) -> ConnectorResult<Vec<KafkaSplit>> {
+    let actual_partitions = topic_partitions.iter().copied().collect::<BTreeSet<_>>();
+    let requested_partitions = offset_ranges.keys().copied().collect::<BTreeSet<_>>();
+    if actual_partitions != requested_partitions {
+        let missing = actual_partitions
+            .difference(&requested_partitions)
+            .copied()
+            .collect::<Vec<_>>();
+        let unexpected = requested_partitions
+            .difference(&actual_partitions)
+            .copied()
+            .collect::<Vec<_>>();
+        bail!(
+            "exact offset ranges for topic {topic} do not match its partitions: missing {missing:?}, unexpected {unexpected:?}"
+        );
+    }
+
+    topic_partitions
+        .iter()
+        .map(|partition| {
+            let range = offset_ranges.get(partition).unwrap();
+            let (low_watermark, high_watermark) = watermarks.get(partition).ok_or_else(|| {
+                anyhow!("watermarks for topic {topic} partition {partition} are missing")
+            })?;
+
+            if range.start_offset > range.stop_offset {
+                bail!(
+                    "invalid offset range for topic {topic} partition {partition}: start {} is greater than stop {}",
+                    range.start_offset,
+                    range.stop_offset
+                );
+            }
+            if range.start_offset < *low_watermark || range.stop_offset > *high_watermark {
+                bail!(
+                    "offset range [{}, {}) for topic {topic} partition {partition} is outside the available range [{low_watermark}, {high_watermark})",
+                    range.start_offset,
+                    range.stop_offset
+                );
+            }
+
+            let split_start_offset = range.start_offset.checked_sub(1).ok_or_else(|| {
+                anyhow!(
+                    "offset range start for topic {topic} partition {partition} cannot be represented as an exclusive split offset"
+                )
+            })?;
+            Ok(KafkaSplit::new(
+                *partition,
+                Some(split_start_offset),
+                Some(range.stop_offset),
+                topic.to_owned(),
+            ))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use maplit::{btreemap, hashmap};
+
+    use super::*;
+    use crate::source::kafka::split::KafkaOffsetRange;
+
+    #[test]
+    fn test_build_splits_for_offset_ranges() {
+        let ranges = btreemap! {
+            0 => KafkaOffsetRange { start_offset: 10, stop_offset: 20 },
+            1 => KafkaOffsetRange { start_offset: 0, stop_offset: 0 },
+        };
+        let watermarks = hashmap! {
+            0 => (5, 25),
+            1 => (0, 0),
+        };
+
+        let splits =
+            build_splits_for_offset_ranges("orders", &[0, 1], &watermarks, &ranges).unwrap();
+
+        assert_eq!(
+            splits,
+            vec![
+                KafkaSplit::new(0, Some(9), Some(20), "orders".to_owned()),
+                KafkaSplit::new(1, Some(-1), Some(0), "orders".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_offset_ranges_must_cover_every_partition() {
+        let ranges = btreemap! {
+            0 => KafkaOffsetRange { start_offset: 10, stop_offset: 20 },
+            2 => KafkaOffsetRange { start_offset: 10, stop_offset: 20 },
+        };
+        let watermarks = hashmap! {
+            0 => (0, 30),
+            1 => (0, 30),
+        };
+
+        let err =
+            build_splits_for_offset_ranges("orders", &[0, 1], &watermarks, &ranges).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "exact offset ranges for topic orders do not match its partitions: missing [1], unexpected [2]"
+        );
+    }
+
+    #[test]
+    fn test_offset_ranges_must_be_within_watermarks() {
+        let ranges = btreemap! {
+            0 => KafkaOffsetRange { start_offset: 4, stop_offset: 21 },
+        };
+        let watermarks = hashmap! {
+            0 => (5, 20),
+        };
+
+        let err = build_splits_for_offset_ranges("orders", &[0], &watermarks, &ranges).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "offset range [4, 21) for topic orders partition 0 is outside the available range [5, 20)"
+        );
+    }
+
+    #[test]
+    fn test_offset_range_start_must_not_exceed_stop() {
+        let ranges = btreemap! {
+            0 => KafkaOffsetRange { start_offset: 20, stop_offset: 10 },
+        };
+        let watermarks = hashmap! {
+            0 => (0, 30),
+        };
+
+        let err = build_splits_for_offset_ranges("orders", &[0], &watermarks, &ranges).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "invalid offset range for topic orders partition 0: start 20 is greater than stop 10"
+        );
     }
 }

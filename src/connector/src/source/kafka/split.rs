@@ -12,11 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeMap;
+
 use risingwave_common::types::JsonbVal;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ConnectorResult;
 use crate::source::{SplitId, SplitMetaData};
+
+/// An exact half-open Kafka offset range: `[start_offset, stop_offset)`.
+///
+/// Unlike [`KafkaSplit::start_offset`], `start_offset` is inclusive here. This is the form used by
+/// the batch planner; it is converted to the split's exclusive representation when splits are
+/// enumerated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct KafkaOffsetRange {
+    pub start_offset: i64,
+    pub stop_offset: i64,
+}
+
+pub type KafkaOffsetRangeMap = BTreeMap<i32, KafkaOffsetRange>;
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Hash)]
 pub struct KafkaSplit {
