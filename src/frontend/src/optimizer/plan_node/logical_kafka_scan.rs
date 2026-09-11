@@ -20,6 +20,7 @@ use std::rc::Rc;
 use pretty_xmlish::{Pretty, XmlNode};
 use risingwave_common::catalog::{KAFKA_TIMESTAMP_COLUMN_NAME, Schema};
 use risingwave_common::types::DataType;
+use risingwave_connector::source::kafka::KafkaOffsetRangeMap;
 
 use super::generic::GenericPlanRef;
 use super::utils::{Distill, childless_record};
@@ -46,6 +47,9 @@ pub struct LogicalKafkaScan {
 
     /// Kafka timestamp range.
     kafka_timestamp_range: (Bound<i64>, Bound<i64>),
+
+    /// Exact per-partition Kafka offset ranges supplied by the planner.
+    kafka_offset_ranges: Option<KafkaOffsetRangeMap>,
 }
 
 impl LogicalKafkaScan {
@@ -60,6 +64,7 @@ impl LogicalKafkaScan {
             base,
             core,
             kafka_timestamp_range,
+            kafka_offset_ranges: None,
         };
 
         if let Some(exprs) = &logical_source.output_exprs {
@@ -73,11 +78,35 @@ impl LogicalKafkaScan {
         self.core.catalog.clone()
     }
 
+    /// Create a Kafka scan over exact half-open `[start, stop)` ranges for every partition.
+    pub fn create_with_offset_ranges(
+        logical_source: &LogicalSource,
+        kafka_offset_ranges: KafkaOffsetRangeMap,
+    ) -> PlanRef {
+        assert!(logical_source.core.is_kafka_connector());
+
+        let core = logical_source.core.clone();
+        let base = PlanBase::new_logical_with_core(&core);
+        let kafka_scan = LogicalKafkaScan {
+            base,
+            core,
+            kafka_timestamp_range: (Bound::Unbounded, Bound::Unbounded),
+            kafka_offset_ranges: Some(kafka_offset_ranges),
+        };
+
+        if let Some(exprs) = &logical_source.output_exprs {
+            LogicalProject::create(kafka_scan.into(), exprs.clone())
+        } else {
+            kafka_scan.into()
+        }
+    }
+
     fn clone_with_kafka_timestamp_range(&self, range: (Bound<i64>, Bound<i64>)) -> Self {
         Self {
             base: self.base.clone(),
             core: self.core.clone(),
             kafka_timestamp_range: range,
+            kafka_offset_ranges: self.kafka_offset_ranges.clone(),
         }
     }
 }
@@ -88,11 +117,15 @@ impl Distill for LogicalKafkaScan {
         let fields = if let Some(catalog) = self.source_catalog() {
             let src = Pretty::from(catalog.name.clone());
             let time = Pretty::debug(&self.kafka_timestamp_range);
-            vec![
+            let mut fields = vec![
                 ("source", src),
                 ("columns", column_names_pretty(self.schema())),
                 ("time_range", time),
-            ]
+            ];
+            if let Some(offset_ranges) = &self.kafka_offset_ranges {
+                fields.push(("offset_ranges", Pretty::debug(offset_ranges)));
+            }
+            fields
         } else {
             vec![]
         };
@@ -268,6 +301,13 @@ impl PredicatePushdown for LogicalKafkaScan {
         predicate: Condition,
         _ctx: &mut PredicatePushdownContext,
     ) -> PlanRef {
+        // An exact offset-bounded scan must not consume a timestamp predicate unless the two
+        // independently-derived ranges are intersected. Keep the timestamp predicate as a normal
+        // filter for now so it cannot be lost.
+        if self.kafka_offset_ranges.is_some() {
+            return LogicalFilter::create(self.clone().into(), predicate);
+        }
+
         let mut range = self.kafka_timestamp_range;
 
         let mut new_conjunctions = Vec::with_capacity(predicate.conjunctions.len());
@@ -295,7 +335,12 @@ impl PredicatePushdown for LogicalKafkaScan {
 
 impl ToBatch for LogicalKafkaScan {
     fn to_batch(&self) -> Result<crate::optimizer::plan_node::BatchPlanRef> {
-        let plan = BatchKafkaScan::new(self.core.clone(), self.kafka_timestamp_range).into();
+        let plan = BatchKafkaScan::new(
+            self.core.clone(),
+            self.kafka_timestamp_range,
+            self.kafka_offset_ranges.clone(),
+        )
+        .into();
         Ok(plan)
     }
 }

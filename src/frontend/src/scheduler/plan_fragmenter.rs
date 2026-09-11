@@ -36,7 +36,7 @@ use risingwave_connector::source::filesystem::opendal_source::{
     BatchPosixFsEnumerator, OpendalAzblob, OpendalGcs, OpendalS3,
 };
 use risingwave_connector::source::iceberg::{IcebergFileScanTask, IcebergScanTaskPlanner};
-use risingwave_connector::source::kafka::KafkaSplitEnumerator;
+use risingwave_connector::source::kafka::{KafkaOffsetRangeMap, KafkaSplitEnumerator};
 use risingwave_connector::source::prelude::DatagenSplitEnumerator;
 use risingwave_connector::source::reader::reader::build_opendal_fs_list_for_batch;
 use risingwave_connector::source::{
@@ -323,6 +323,7 @@ pub enum SourceFetchParameters {
         lower: Option<i64>,
         upper: Option<i64>,
     },
+    KafkaOffsetRanges(KafkaOffsetRangeMap),
     Empty,
 }
 
@@ -407,6 +408,22 @@ impl SourceFetchInfo {
                         .await?;
                 let split_info = kafka_enumerator
                     .list_splits_batch(lower, upper)
+                    .await?
+                    .into_iter()
+                    .map(SplitImpl::Kafka)
+                    .collect_vec();
+
+                Ok(SourceScanInfo::Complete(split_info))
+            }
+            (
+                ConnectorProperties::Kafka(prop),
+                SourceFetchParameters::KafkaOffsetRanges(offset_ranges),
+            ) => {
+                let mut kafka_enumerator =
+                    KafkaSplitEnumerator::new(*prop, SourceEnumeratorContext::dummy().into())
+                        .await?;
+                let split_info = kafka_enumerator
+                    .list_splits_batch_by_offset_ranges(&offset_ranges)
                     .await?
                     .into_iter()
                     .map(SplitImpl::Kafka)
@@ -1214,14 +1231,20 @@ impl BatchPlanFragmenter {
             if let Some(source_catalog) = source_catalog {
                 let property =
                     ConnectorProperties::extract(source_catalog.with_properties.clone(), false)?;
-                let timestamp_bound = batch_kafka_scan.kafka_timestamp_range_value();
+                let fetch_parameters =
+                    if let Some(offset_ranges) = batch_kafka_scan.kafka_offset_ranges() {
+                        SourceFetchParameters::KafkaOffsetRanges(offset_ranges.clone())
+                    } else {
+                        let timestamp_bound = batch_kafka_scan.kafka_timestamp_range_value();
+                        SourceFetchParameters::KafkaTimebound {
+                            lower: timestamp_bound.0,
+                            upper: timestamp_bound.1,
+                        }
+                    };
                 return Ok(Some(SourceScanInfo::new(SourceFetchInfo {
                     schema: batch_kafka_scan.base.schema().clone(),
                     connector: property,
-                    fetch_parameters: SourceFetchParameters::KafkaTimebound {
-                        lower: timestamp_bound.0,
-                        upper: timestamp_bound.1,
-                    },
+                    fetch_parameters,
                 })));
             }
         } else if let Some(batch_iceberg_scan) = node.as_batch_iceberg_scan() {
