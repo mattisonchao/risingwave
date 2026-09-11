@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use risingwave_common::config::storage::FileCacheRuntimeConfig;
 use risingwave_common::config::streaming::CacheRefillPolicy;
 use risingwave_common::config::{
     EvictionConfig, ObjectStoreConfig, RwConfig, StorageMemoryConfig, extract_storage_memory_config,
@@ -100,7 +101,7 @@ pub struct StorageOpts {
     pub data_file_cache_submit_queue_size_threshold_mb: usize,
     pub data_file_cache_fifo_probation_ratio: f64,
     pub data_file_cache_blob_index_size_kb: usize,
-    pub data_file_cache_runtime_config: foyer::RuntimeOptions,
+    pub data_file_cache_runtime_config: FileCacheRuntimeConfig,
     pub data_file_cache_throttle: foyer::Throttle,
 
     pub cache_refill_data_refill_levels: Vec<u32>,
@@ -129,7 +130,7 @@ pub struct StorageOpts {
     pub meta_file_cache_submit_queue_size_threshold_mb: usize,
     pub meta_file_cache_fifo_probation_ratio: f64,
     pub meta_file_cache_blob_index_size_kb: usize,
-    pub meta_file_cache_runtime_config: foyer::RuntimeOptions,
+    pub meta_file_cache_runtime_config: FileCacheRuntimeConfig,
     pub meta_file_cache_throttle: foyer::Throttle,
     pub sst_skip_bloom_filter_in_serde: bool,
 
@@ -192,6 +193,8 @@ pub struct StorageOpts {
     pub iceberg_compaction_size_estimation_smoothing_factor: f64,
     /// Multiplier for pending waiting parallelism budget for iceberg compaction task queue.
     pub iceberg_compaction_pending_parallelism_budget_multiplier: f32,
+    /// Maximum number of Iceberg compaction tasks requested in one pull.
+    pub iceberg_compaction_max_pull_task_count: u32,
     /// Pull interval for iceberg compaction task requests in milliseconds.
     pub iceberg_compaction_pull_interval_ms: u64,
     /// Whether to enable prefetch for iceberg compaction.
@@ -367,6 +370,9 @@ impl From<(&RwConfig, &SystemParamsReader, &StorageMemoryConfig)> for StorageOpt
             iceberg_compaction_pending_parallelism_budget_multiplier: c
                 .storage
                 .iceberg_compaction_pending_parallelism_budget_multiplier,
+            iceberg_compaction_max_pull_task_count: c
+                .storage
+                .iceberg_compaction_max_pull_task_count,
             iceberg_compaction_pull_interval_ms: c.storage.iceberg_compaction_pull_interval_ms,
             iceberg_compaction_enable_prefetch: c.storage.iceberg_compaction_enable_prefetch,
             iceberg_compaction_target_binpack_group_size_mb: c
